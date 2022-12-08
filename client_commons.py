@@ -17,7 +17,7 @@ TYPE_ACTION_ACK = 0b1001
 WINDOW_SIZE = 5
 RETRY_COUNT = 5
 TIMEOUT = 1
-MAX_FRAGMENT_SIZE = 1466
+MAX_FRAGMENT_SIZE = 1467
 KEEP_ALIVE_TIMEOUT = 10
 KEEP_ALIVE_SEND_PERIODIC = 5
 
@@ -63,13 +63,13 @@ class ClientCommons:
             try:
                 pair = self.conn.recvfrom(1472)
                 data = pair[0]
-                msg_type = data[0]
-                fragment = (data[1] << 16) + (data[2] << 8) + data[3]
+                msg_type = data[0] >> 4
+                fragment = ((data[0] & 0x0F) << 16) + (data[1] << 8) + data[2]
                 if not self.check_corrupted(data):
                     print(f"Corrupted data detected {fragment}")
                     threading.Thread(target=self.dispatch_corrupted, args=(self.client, msg_type, fragment,)).start()
                 else:
-                    data = data[4: len(data) - 2]
+                    data = data[3: len(data) - 2]
                     threading.Thread(target=self.dispatch_message, args=(pair[1], msg_type, fragment, data,)).start()
             except socket.timeout:
                 pass
@@ -102,8 +102,7 @@ class ClientCommons:
 
     def build_packet(self, msg_type, fragment=0, data: bytes = None, simulate_error=False):
         packet = bytearray()
-        packet.append(msg_type)
-        packet.append(fragment >> 16)
+        packet.append((msg_type << 4) + (fragment >> 16))
         packet.append((fragment >> 8) & 0xFF)
         packet.append(fragment & 0xFF)
         if data:
@@ -111,7 +110,7 @@ class ClientCommons:
                 packet.append(byte)
         crc = self.crc16(packet)
         if simulate_error:
-            rand_data = random.randrange(4, len(data) + 3)
+            rand_data = random.randrange(3, len(data) + 2)
             packet[rand_data] = random.randrange(255)
         packet.append(crc >> 8)
         packet.append(crc & 0xFF)
