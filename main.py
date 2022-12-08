@@ -1,5 +1,6 @@
+import random
 
-poly = 0xA001
+poly = 0x8005
 
 
 def crc16(data: bytes):
@@ -14,26 +15,44 @@ def crc16(data: bytes):
     return crc
 
 
-def build_packet(msg_type, fragment, data: str):
-    packet = bytearray()
-    packet.append(msg_type << 4 + (fragment >> 12))
-    packet.append(fragment & 0xFF)
+def build_packet(msg_type, fragment, data: str, simulate_err=False):
+    pkt = bytearray()
+    pkt.append(msg_type)
+    pkt.append(fragment >> 16)
+    pkt.append((fragment >> 8) & 0xFF)
+    pkt.append(fragment & 0xFF)
     for byte in data.encode():
-        packet.append(byte)
-    crc = crc16(packet)
-    packet.append(crc >> 8)
-    packet.append(crc & 0x0F)
-    return packet
+        pkt.append(byte)
+    crc = crc16(pkt)
+    if simulate_err:
+        rand_data = random.randrange(len(data))
+        pkt[rand_data] = random.randrange(255)
+    pkt.append(crc >> 8)
+    pkt.append(crc & 0xFF)
+    return pkt
 
 
 
-data = bytes([0x43, 0, 0, 0x37, 0x31, 0x32, 0x33, 0x34])
-crcVal = crc16(data)
-print(data)
-print(crcVal)
-data = bytes([0x43, 0, 0, 0x37, 0x31, 0x32, 0x33, 0x34, crcVal & 0xFF, crcVal >> 8])
-print(data)
-print(crc16(data))
+# data = bytes([0x90, 0])
+# crcVal = crc16(data)
+# print(data)
+# data = bytes([0x90, 0, crcVal & 0xFF, crcVal >> 8])
+# print(data)
+# print(crc16(data))
 
 # print(crcVal)
 # print(crc16("1234".encode() + crcVal.to_bytes(2, "little")))
+
+# packet = build_packet(0, 0, "Fs")
+packet2 = build_packet(0, 0, "", False)
+# print(packet)
+# print(crc16(packet))
+#
+# print(packet2)
+# print(crc16(packet))
+
+print(packet2)
+crc_data = packet2[len(packet2)-2:]
+crc = (crc_data[0] << 8) + crc_data[1]
+print(crc)
+print(crc16(packet2[:len(packet2)-2]) == crc)

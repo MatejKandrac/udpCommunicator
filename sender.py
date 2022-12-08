@@ -2,20 +2,36 @@ from client_commons import *
 
 
 class Sender(ClientCommons):
-
-    fragment_size = 1468
+    fragment_size = MAX_FRAGMENT_SIZE
     file_path: str
-    connection_retries = 5
-    WINDOW_SIZE = 5
     free_window = WINDOW_SIZE
+    canceling = False
     connecting = False
     preparing_transfer = False
     repeat_indexes = []
     fragments = []
     window_index = 0
 
-    def __init__(self):
+    def __init__(self, conn=None):
         super().__init__()
+        if conn:
+            if not self.connect(conn=conn):
+                print("Failed to connect, please reenter data")
+        if not self.isConnected:
+            while True:
+                print("Ip addr: ", end='')
+                ip_addr = input()
+                print("Port: ", end='')
+                port = int(input())
+                if not self.connect(ip_addr, port):
+                    print("Failed to connect, type n to terminate")
+                    data = input()
+                    if data == 'n':
+                        self.canceling = True
+                        break
+                else:
+                    self.init_success = True
+                    break
 
     def dispatch_message(self, host, msg_type, fragment, data):
         if msg_type == TYPE_ACTION_ACK:
@@ -25,10 +41,17 @@ class Sender(ClientCommons):
                 self.connecting = False
         if msg_type == TYPE_ALIVE_MESSAGE:
             self.lastAlive = time.time()
+        if msg_type == TYPE_TERMINATE_CONN:
+            self.conn.sendto(self.build_packet(TYPE_ACTION_ACK), self.client)
+            self.hard_terminate()
         if msg_type == TYPE_FRAGMENT_ACK:
             self.free_window += 1
             self.fragments[fragment]["ack_state"] = True
-            print(f"ACK {fragment}")
+            print(f"ACKED {fragment}")
+        if msg_type == TYPE_FRAGMENT_REPEAT:
+            self.repeat_indexes.append(fragment)
+            self.free_window += 1
+            print(f"REPEAT REQUESTED {fragment}")
 
     def get_preferred_fragment(self):
         result: []
@@ -55,26 +78,36 @@ class Sender(ClientCommons):
     def check_timeouts(self):
         now = time.time()
         for i in range(0, self.window_index):
-            if now - self.fragments[i]["sent_time"] > 5:
+            if (not self.fragments[i]["ack_state"]) and (now - self.fragments[i]["sent_time"] > 5):
+                self.fragments[i]["sent_time"] = now
+                self.free_window += 1
                 self.repeat_indexes.append(i)
 
     def send_bytes(self, data, start_payload):
         if len(data) > 2_097_152:
             print("Data payload is too large")
             return
+        print("Do you want to simulate errors? y/N")
+        str_input = input()
+        errors = False
+        if (str_input == 'Y') or (str_input == 'y'):
+            errors = True
+
         index = 0
         self.fragments = []
         for i in range(0, len(data), self.fragment_size):
             self.fragments.append({
                 "index": index,
                 "data": data[i: i + self.fragment_size],
-                "sent_time": 0,
-                "ack_state": False
+                "sent_time": 0.0,
+                "ack_state": False,
+                "simulate_error": False if (not errors) else bool(random.getrandbits(1))
             })
             index += 1
         self.window_index = 0
         self.ack_lock = True
-        self.conn.sendto(self.build_packet(TYPE_PREPARE_TRANSMISSION, data=start_payload.encode()), self.client)
+        self.free_window = WINDOW_SIZE
+        self.conn.sendto(self.build_packet(TYPE_PREPARE_TRANSMISSION, fragment=index, data=start_payload.encode()), self.client)
         while self.ack_lock:
             pass
         print("STARTING TRANSFER")
@@ -83,16 +116,17 @@ class Sender(ClientCommons):
                 self.free_window -= 1
                 fragment = self.get_preferred_fragment()
                 if fragment is not None:
-                    print(f"SENDING {fragment['index']}")
-                    self.conn.sendto(self.build_packet(TYPE_DATA_FRAGMENT, fragment["index"], fragment["data"]), self.client)
+                    print(f"SENDING {fragment['index']} corrupted: {fragment['simulate_error']}")
+                    self.conn.sendto(self.build_packet(TYPE_DATA_FRAGMENT, fragment["index"], fragment["data"], fragment["simulate_error"]),
+                                     self.client)
+                    fragment["simulate_error"] = False
                     fragment["sent_time"] = time.time()
             else:
                 self.check_timeouts()
-        self.ack_lock = True
-        print("TRANSMISSION COMPLETED")
-        self.conn.sendto(self.build_packet(TYPE_DATA_TRANSMISSION_COMPLETE), self.client)
-        while self.ack_lock:
-            pass
+        if not self.await_response(self.build_packet(TYPE_DATA_TRANSMISSION_COMPLETE)):
+            print("Could not finish transmission. Aborting")
+        else:
+            print("TRANSMISSION COMPLETED")
 
     def text_transfer(self):
         print("Press ENTER to exit text transfer, otherwise type message to send")
@@ -111,21 +145,15 @@ class Sender(ClientCommons):
             split = file.name.split(delim)
             data = file.read()
             file.close()
-            self.send_bytes(data, "F"+split[len(split) - 1])
+            self.send_bytes(data, "F" + split[len(split) - 1])
         except FileNotFoundError:
             print("File not found")
         except Exception:
             print("Error reading file")
 
     def loop(self):
-        print("Ip addr: ", end='')
-        ip_addr = input()
-        print("Port: ", end='')
-        port = int(input())
-        if not self.connect(ip_addr, port):
-            return
         try:
-            while True:
+            while self.isConnected:
                 print("Type END to end")
                 print("Type SWAP to swap roles")
                 print("Type TXT to send text messages")
@@ -134,43 +162,44 @@ class Sender(ClientCommons):
                 data = input()
                 if data == "END":
                     self.soft_terminate()
-                    break
                 if data == "TXT":
                     self.text_transfer()
                 if data == "FILE":
                     self.file_transfer()
+                if data == "SWAP":
+
+                    return self.client
                 if data == "OFFSET":
                     self.change_offset()
-        except Exception as e:
-            print(f"ERROR {e}")
-        self.hard_terminate()
+        except Exception:
+            self.hard_terminate()
 
-    def connect(self, ip, conn_port):
+    def connect(self, ip=None, conn_port=None, conn=None):
         print("Connecting...")
         threading.Thread(target=self.data_handler).start()
-        self.client = (ip, conn_port)
-        retries = self.connection_retries
+        self.client = conn if conn else (ip, conn_port)
         self.connecting = True
-        while not self.isConnected:
-            self.conn.sendto(self.build_packet(TYPE_START_CONN), self.client)
-            if retries == 0:
-                print("Failed to connect")
-                self.hard_terminate()
-                return False
-            time.sleep(1)
-            retries -= 1
+        if not self.await_response(self.build_packet(TYPE_START_CONN)):
+            print("Failed to connect")
+            self.client = None
+            return False
         print("Connected")
         self.start_keep_alive()
         return True
 
-    def set_file_path(self, path):
-        self.file_path = path
-
     def change_offset(self):
         print("Type int value of offset")
-        self.fragment_size = int(input())
+        while True:
+            size_str = input()
+            try:
+                size = int(size_str)
+                if size < 1:
+                    print("Cannot set offset. Offset has to be larger that 0.")
+                elif size > MAX_FRAGMENT_SIZE:
+                    print(f"Cannot set offset. Offset has to be lower than {MAX_FRAGMENT_SIZE}.")
+                else:
+                    self.fragment_size = size
+                    break
+            except:
+                print("Cannot set offset. Invalid value entered.")
         print(f"Offset set to {self.fragment_size}")
-
-
-sender = Sender()
-sender.loop()
