@@ -1,5 +1,7 @@
 import socket
 import threading
+import multiprocessing
+import ctypes
 import time
 import random
 from os import path
@@ -33,8 +35,10 @@ swapping = False
 last_alive = 0
 client = None
 is_sender = False
-terminating = False
 isText = False
+terminating = False
+keyboard_interrupt = False
+transmission_in_progress = False
 file_path = ""
 fragment_size = MAX_FRAGMENT_SIZE
 free_window = WINDOW_SIZE
@@ -42,7 +46,7 @@ connecting = False
 repeat_indexes = []
 fragmented_data = []
 window_index = 0
-
+stdin = open(0)
 
 # DEFINE SOCKET
 conn = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM)
@@ -65,6 +69,29 @@ def main():
         print("Invalid option, terminating.")
         exit(0)
     loop()
+    stdin.close()
+
+
+def input_process(str_input, stdin):
+    data = stdin.readline()
+    str_input.value = data[0: len(data) - 1]
+
+
+def interruptable_input():
+    global keyboard_interrupt
+    manager = multiprocessing.Manager()
+    str_input = manager.Value(ctypes.c_char_p, None)
+    process = multiprocessing.Process(target=input_process, args=(str_input, stdin))
+    process.start()
+    while (not keyboard_interrupt) and (str_input.value is None):
+        pass
+    process.terminate()
+    process.join()
+    if keyboard_interrupt:
+        print("Input terminated by other process")
+        keyboard_interrupt = False
+        return None
+    return str_input.value
 
 
 def loop():
@@ -79,22 +106,34 @@ def loop():
                 print("Type TXT to send text messages")
                 print("Type FILE to send file")
                 print("Type OFFSET to set fragment size")
-                data = input()
-                if data == "END":
+                data = interruptable_input()
+                if data is None:
+                    pass
+                elif data == "END":
                     soft_terminate()
                     break
-                if data == "TXT":
+                elif data == "TXT":
                     text_transfer()
-                if data == "FILE":
+                elif data == "FILE":
                     file_transfer()
-                if data == "SWAP":
+                elif data == "SWAP":
                     if await_response(build_packet(TYPE_SWAP_MODE)):
                         swapping = True
                     else:
                         print("Could not swap. Client did not respond")
-                if data == "OFFSET":
+                elif data == "OFFSET":
                     change_offset()
-            elif terminating:
+            elif not transmission_in_progress:
+                print("Type SWAP to swap roles")
+                data = interruptable_input()
+                if data is None:
+                    pass
+                elif data == 'SWAP':
+                    if await_response(build_packet(TYPE_SWAP_MODE)):
+                        swapping = True
+                    else:
+                        print("Could not swap. Client did not respond")
+            if terminating:
                 break
             if swapping:
                 is_sender = not is_sender
@@ -103,7 +142,8 @@ def loop():
         hard_terminate()
     except KeyboardInterrupt:
         exit(0)
-    except:
+    except Exception as e:
+        print(e)
         hard_terminate()
 
 
@@ -219,8 +259,10 @@ def await_response(packet):
 def hard_terminate():
     print("CONNECTION WAS TERMINATED")
     global is_connected
+    global keyboard_interrupt
     global terminating
     terminating = True
+    keyboard_interrupt = True
     is_connected = False
     conn.close()
 
@@ -273,14 +315,21 @@ def prepare_transmission(fragments, data: bytes):
     global isText
     global fragmented_data
     global file_path
+    global keyboard_interrupt
+    global transmission_in_progress
     parsed_data = data.decode()
     isText = parsed_data[0] == 'T'
     fragmented_data = [None] * fragments
     if not isText:
         filename = parsed_data[1:]
         while True:
+            transmission_in_progress = True
+            keyboard_interrupt = True
+            time.sleep(0.1)
             print(f"Enter path for receiving file {filename}")
-            file_path = input()
+            file_path = interruptable_input()
+            if file_path is None:
+                return
             if path.isdir(file_path) and path.exists(file_path):
                 break
             print("Invalid path. Please reenter")
@@ -292,6 +341,7 @@ def prepare_transmission(fragments, data: bytes):
 
 
 def finish_transfer():
+    global transmission_in_progress
     print(f"FINISHING TRANSFER")
     conn.sendto(build_packet(TYPE_ACTION_ACK), client)
     if isText:
@@ -305,6 +355,7 @@ def finish_transfer():
             file.write(fragment)
         file.close()
         print(f"Saved file to {file_path}")
+    transmission_in_progress = False
     print()
 
 
@@ -315,6 +366,7 @@ def dispatch_message(host, msg_type, fragment, data):
     global is_connected
     global connecting
     global free_window
+    global keyboard_interrupt
     if msg_type == TYPE_ACTION_ACK:
         ack_lock = False
         if connecting:
@@ -344,6 +396,7 @@ def dispatch_message(host, msg_type, fragment, data):
         finish_transfer()
     if msg_type == TYPE_SWAP_MODE:
         swapping = True
+        keyboard_interrupt = True
         conn.sendto(build_packet(TYPE_ACTION_ACK), client)
 
 
@@ -397,7 +450,9 @@ def send_bytes(data, start_payload):
         print("Data payload is too large")
         return
     print("Do you want to simulate errors? y/N")
-    str_input = input()
+    str_input = interruptable_input()
+    if str_input is None:
+        return
     errors = False
     if (str_input == 'Y') or (str_input == 'y'):
         errors = True
@@ -439,7 +494,9 @@ def send_bytes(data, start_payload):
 def text_transfer():
     print("Press ENTER to exit text transfer, otherwise type message to send")
     while True:
-        text = input()
+        text = interruptable_input()
+        if text is None:
+            return
         if text == '':
             break
         send_bytes(text.encode(), "T")
@@ -447,7 +504,7 @@ def text_transfer():
 
 def file_transfer():
     print("Enter file path to send")
-    path = input()
+    path = interruptable_input()
     try:
         file = open(path, "rb")
         delim = '/' if path.__contains__('/') else '\\'
@@ -480,7 +537,9 @@ def change_offset():
     global fragment_size
     print("Type int value of offset")
     while True:
-        size_str = input()
+        size_str = interruptable_input()
+        if size_str is None:
+            return
         try:
             size = int(size_str)
             if size < 1:
