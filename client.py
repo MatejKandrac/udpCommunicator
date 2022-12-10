@@ -1,3 +1,5 @@
+# Author: Matej Kandráč
+
 import socket
 import threading
 import multiprocessing
