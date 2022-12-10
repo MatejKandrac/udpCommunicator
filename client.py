@@ -23,36 +23,39 @@ WINDOW_SIZE = 5
 RETRY_COUNT = 5
 TIMEOUT = 2
 MAX_FRAGMENT_SIZE = 1467
-KEEP_ALIVE_TIMEOUT = 10
+KEEP_ALIVE_TIMEOUT = 15
 KEEP_ALIVE_SEND_PERIODIC = 5
+SENDING_FRAGMENT_TIMEOUT = 5
 MAX_DATA_PAYLOAD = 2_097_152
+
+INIT_TYPE_FILE = "F"
+INIT_TYPE_TEXT = "T"
+INIT_TYPE_FILENAME = "N"
 
 # DEFINE HELPER VARIABLES
 is_connected = False
 ack_lock = False
-init_success = False
 swapping = False
 last_alive = 0
 client = None
 is_sender = False
-isText = False
+transfer_type = ""
 terminating = False
 keyboard_interrupt = False
 transmission_in_progress = False
 file_path = ""
 fragment_size = MAX_FRAGMENT_SIZE
 free_window = WINDOW_SIZE
-connecting = False
 repeat_indexes = []
 fragmented_data = []
 window_index = 0
-stdin = open(0)
 
 # DEFINE SOCKET
 conn = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM)
 conn.settimeout(1)
 
 
+# Main function initializes first mode of client and launches loop function
 def main():
     global is_sender
     print("Select mode:\nr - Receiver\ns - Sender")
@@ -69,19 +72,21 @@ def main():
         print("Invalid option, terminating.")
         exit(0)
     loop()
-    stdin.close()
 
 
-def input_process(str_input, stdin):
-    data = stdin.readline()
+# Method waits for user input. It runs on different process so it can be terminated easily
+def input_process(str_input,):
+    std_in = open(0)
+    data = std_in.readline()
     str_input.value = data[0: len(data) - 1]
 
 
+# Method starts input process and waits for input. Terminates if keyboard_interrupt flag is true and returns None
 def interruptable_input():
     global keyboard_interrupt
     manager = multiprocessing.Manager()
     str_input = manager.Value(ctypes.c_char_p, None)
-    process = multiprocessing.Process(target=input_process, args=(str_input, stdin))
+    process = multiprocessing.Process(target=input_process, args=(str_input,))
     process.start()
     while (not keyboard_interrupt) and (str_input.value is None):
         pass
@@ -94,6 +99,7 @@ def interruptable_input():
     return str_input.value
 
 
+# Loop method prints user actions on screen and executes methods. Actions vary depending on mode
 def loop():
     global is_connected
     global is_sender
@@ -123,7 +129,7 @@ def loop():
                         print("Could not swap. Client did not respond")
                 elif data == "OFFSET":
                     change_offset()
-            elif not transmission_in_progress:
+            elif not transmission_in_progress and is_connected:
                 print("Type SWAP to swap roles")
                 data = interruptable_input()
                 if data is None:
@@ -147,6 +153,7 @@ def loop():
         hard_terminate()
 
 
+# Method initializes receiver as first mode
 def init_receiver():
     global conn
     ip = socket.gethostbyname(socket.gethostname())
@@ -170,6 +177,7 @@ def init_receiver():
     return True
 
 
+# Method initializes sender as first client
 def init_sender():
     global conn
     while True:
@@ -186,7 +194,7 @@ def init_sender():
             return True
 
 
-# CALCULATE CRC16
+# Function calculates CRC16 of given data
 def crc16(data: bytes):
     crc = 0xFFFF
     for byte in data:
@@ -218,6 +226,7 @@ def build_packet(msg_type, fragment=0, data: bytes = None, simulate_error=False)
 
 
 # HANDLE INCOMING DATA, THIS WORKS ON SEPARATE THREAD
+# Detects corruptions or data and starts dispatcher thread so it can listen again without block
 def data_handler():
     print("Starting data handler job")
     while True:
@@ -228,10 +237,10 @@ def data_handler():
             fragment = ((data[0] & 0x0F) << 16) + (data[1] << 8) + data[2]
             if not check_corrupted(data):
                 print(f"Corrupted data detected {fragment}")
-                threading.Thread(target=dispatch_corrupted, args=(msg_type, fragment)).start()
+                dispatch_corrupted(msg_type, fragment)
             else:
                 data = data[3: len(data) - 2]
-                threading.Thread(target=dispatch_message, args=(pair[1], msg_type, fragment, data)).start()
+                dispatch_message(pair[1], msg_type, fragment, data)
         except socket.timeout:
             pass
         except OSError:
@@ -239,6 +248,7 @@ def data_handler():
             break
 
 
+# Function works as ack required send. Client sends the packet with retry count and waits for acknowledgement
 def await_response(packet):
     global ack_lock
     global conn
@@ -256,17 +266,20 @@ def await_response(packet):
     return True
 
 
+# Function hard terminates the client, interrupting any input and closing connection
 def hard_terminate():
-    print("CONNECTION WAS TERMINATED")
     global is_connected
     global keyboard_interrupt
     global terminating
+    global ack_lock
     terminating = True
     keyboard_interrupt = True
+    ack_lock = False
     is_connected = False
     conn.close()
 
 
+# Function soft terminates, waits for other user acknowledgement and terminates
 def soft_terminate():
     if await_response(build_packet(TYPE_TERMINATE_CONN)):
         hard_terminate()
@@ -274,6 +287,8 @@ def soft_terminate():
         print("Could not end connection due to client not responding.")
 
 
+# Method periodically sends keep alive packets to other client.
+# Also checks if other client responded in recent time, if not it hard terminates the client
 def keep_alive():
     global last_alive
     last_alive = time.time()
@@ -289,12 +304,14 @@ def keep_alive():
     print("Terminating keep alive job")
 
 
+# Function checks if data is corrupted. It calculates the CRC from data and compares it to attached CRC
 def check_corrupted(data):
     crc_data = data[len(data) - 2:]
     crc = (crc_data[0] << 8) + crc_data[1]
     return crc16(data[:len(data) - 2]) == crc
 
 
+# Function accepts connection from other host, remembering it and setting state as connected
 def accept_connection(host):
     print(f"HOST CONNECTED: {host}")
     global client
@@ -305,23 +322,18 @@ def accept_connection(host):
     threading.Thread(target=keep_alive).start()
 
 
-def build_data(fragment, data: bytes):
-    print(f"RECEIVED FRAGMENT {fragment}")
-    fragmented_data[fragment] = data
-    conn.sendto(build_packet(TYPE_FRAGMENT_ACK, fragment), client)
-
-
+# Funciton prepares a transmission, reads data and filename and asks user for save path
 def prepare_transmission(fragments, data: bytes):
-    global isText
+    global transfer_type
     global fragmented_data
     global file_path
     global keyboard_interrupt
     global transmission_in_progress
     parsed_data = data.decode()
-    isText = parsed_data[0] == 'T'
+    transfer_type = parsed_data[0]
     fragmented_data = [None] * fragments
-    if not isText:
-        filename = parsed_data[1:]
+    if transfer_type == INIT_TYPE_FILE:
+        filename = file_path
         while True:
             transmission_in_progress = True
             keyboard_interrupt = True
@@ -340,15 +352,22 @@ def prepare_transmission(fragments, data: bytes):
     conn.sendto(build_packet(TYPE_ACTION_ACK), client)
 
 
+# Function finishes the transfer, saving data to file or printing data depending if it is text or file
 def finish_transfer():
+    global file_path
     global transmission_in_progress
-    print(f"FINISHING TRANSFER")
     conn.sendto(build_packet(TYPE_ACTION_ACK), client)
-    if isText:
+    if transfer_type == INIT_TYPE_TEXT:
         print("Got text message: ", end='')
         for fragment in fragmented_data:
             for char in fragment:
                 print(chr(char), end='')
+    elif transfer_type == INIT_TYPE_FILENAME:
+        filename = ""
+        for fragment in fragmented_data:
+            for char in fragment:
+                filename += chr(char)
+        file_path = filename
     else:
         file = open(file_path, 'wb')
         for fragment in fragmented_data:
@@ -359,19 +378,16 @@ def finish_transfer():
     print()
 
 
+# Function dispatches message. Every message type is for something else
 def dispatch_message(host, msg_type, fragment, data):
     global last_alive
     global swapping
     global ack_lock
     global is_connected
-    global connecting
     global free_window
     global keyboard_interrupt
     if msg_type == TYPE_ACTION_ACK:
         ack_lock = False
-        if connecting:
-            is_connected = True
-            connecting = False
     if msg_type == TYPE_ALIVE_MESSAGE:
         last_alive = time.time()
     if msg_type == TYPE_START_CONN:
@@ -387,11 +403,12 @@ def dispatch_message(host, msg_type, fragment, data):
     if msg_type == TYPE_FRAGMENT_REPEAT:
         repeat_indexes.append(fragment)
         free_window += 1
-        print(f"REPEAT REQUESTED {fragment}")
     if msg_type == TYPE_PREPARE_TRANSMISSION:
         threading.Thread(target=prepare_transmission, args=(fragment, data)).start()
     if msg_type == TYPE_DATA_FRAGMENT:
-        build_data(fragment, data)
+        print(f"RECEIVED FRAGMENT {fragment}")
+        fragmented_data[fragment] = data
+        conn.sendto(build_packet(TYPE_FRAGMENT_ACK, fragment), client)
     if msg_type == TYPE_DATA_TRANSMISSION_COMPLETE:
         finish_transfer()
     if msg_type == TYPE_SWAP_MODE:
@@ -400,12 +417,15 @@ def dispatch_message(host, msg_type, fragment, data):
         conn.sendto(build_packet(TYPE_ACTION_ACK), client)
 
 
+# Function handles corrupted messages. If message is data fragment, data is allocated and fragment is not out of bounds,
+# it requests fragment repetition
 def dispatch_corrupted(msg_type, fragment):
     if not is_sender:
         if ((fragmented_data is not None) and (fragment < len(fragmented_data))) and (msg_type == TYPE_DATA_FRAGMENT):
             conn.sendto(build_packet(TYPE_FRAGMENT_REPEAT, fragment), client)
 
 
+# Function gets preferred fragment to send. Prioritizes fragments to repeat and if there are none, then it uses next index
 def get_preferred_fragment():
     global window_index
     result: []
@@ -422,6 +442,7 @@ def get_preferred_fragment():
     return result
 
 
+# Function checks if all of the fragments were sent and are acknowledged by other client
 def all_data_sent():
     if not ((window_index == len(fragmented_data)) and len(repeat_indexes) == 0):
         return False
@@ -431,17 +452,19 @@ def all_data_sent():
     return True
 
 
+# Function checks for fragments which are timed out. If there are some, we add them to repeat indexes for the next send
 def check_timeouts():
     global free_window
     now = time.time()
     for i in range(0, window_index):
-        if (not fragmented_data[i]["ack_state"]) and (now - fragmented_data[i]["sent_time"] > 5):
+        if (not fragmented_data[i]["ack_state"]) and \
+                (now - fragmented_data[i]["sent_time"] > SENDING_FRAGMENT_TIMEOUT):
             fragmented_data[i]["sent_time"] = now
             free_window += 1
             repeat_indexes.append(i)
 
 
-def send_bytes(data, start_payload):
+def send_bytes(data, start_payload, ask_errors=True):
     global window_index
     global ack_lock
     global free_window
@@ -449,13 +472,14 @@ def send_bytes(data, start_payload):
     if len(data) > MAX_DATA_PAYLOAD:
         print("Data payload is too large")
         return
-    print("Do you want to simulate errors? y/N")
-    str_input = interruptable_input()
-    if str_input is None:
-        return
     errors = False
-    if (str_input == 'Y') or (str_input == 'y'):
-        errors = True
+    if ask_errors:
+        print("Do you want to simulate errors? y/N")
+        str_input = interruptable_input()
+        if str_input is None:
+            return
+        if (str_input == 'Y') or (str_input == 'y'):
+            errors = True
     index = 0
     fragmented_data = []
     for i in range(0, len(data), fragment_size):
@@ -480,7 +504,8 @@ def send_bytes(data, start_payload):
             fragment = get_preferred_fragment()
             if fragment is not None:
                 print(f"SENDING {fragment['index']} corrupted: {fragment['simulate_error']}")
-                conn.sendto(build_packet(TYPE_DATA_FRAGMENT, fragment["index"], fragment["data"], fragment["simulate_error"]), client)
+                conn.sendto(build_packet(TYPE_DATA_FRAGMENT, fragment["index"],
+                                         fragment["data"], fragment["simulate_error"]), client)
                 fragment["simulate_error"] = False
                 fragment["sent_time"] = time.time()
         else:
@@ -491,6 +516,7 @@ def send_bytes(data, start_payload):
         print("TRANSMISSION COMPLETED")
 
 
+# Method loops forever, sending messages as bytes to other client
 def text_transfer():
     print("Press ENTER to exit text transfer, otherwise type message to send")
     while True:
@@ -499,9 +525,10 @@ def text_transfer():
             return
         if text == '':
             break
-        send_bytes(text.encode(), "T")
+        send_bytes(text.encode(), INIT_TYPE_TEXT)
 
 
+# Method opens a file and sends the data to other client
 def file_transfer():
     print("Enter file path to send")
     path = interruptable_input()
@@ -511,33 +538,36 @@ def file_transfer():
         split = file.name.split(delim)
         data = file.read()
         file.close()
-        send_bytes(data, "F" + split[len(split) - 1])
+        send_bytes(split[len(split) - 1].encode(), INIT_TYPE_FILENAME, False)
+        send_bytes(data, INIT_TYPE_FILE)
     except FileNotFoundError:
         print("File not found")
-    except Exception:
-        print("Error reading file")
+    except Exception as e:
+        print(f"Error occurred {e}")
 
 
+# Method connects to ip and port with retry count. Sets connected arguments
 def connect(ip, conn_port):
     global client
-    global connecting
+    global is_connected
     print("Connecting...")
     client = (ip, conn_port)
-    connecting = True
     if not await_response(build_packet(TYPE_START_CONN)):
         print("Failed to connect")
         client = None
         return False
     print("Connected")
+    is_connected = True
     threading.Thread(target=keep_alive).start()
     return True
 
 
+# Method changes the offset which user types in
 def change_offset():
     global fragment_size
     print("Type int value of offset")
     while True:
-        size_str = interruptable_input()
+        size_str: str = interruptable_input()
         if size_str is None:
             return
         try:
@@ -554,4 +584,5 @@ def change_offset():
     print(f"Offset set to {fragment_size}")
 
 
-main()
+if __name__ == '__main__':
+    main()
