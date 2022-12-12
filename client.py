@@ -3,6 +3,7 @@
 import socket
 import threading
 import multiprocessing
+import subprocess
 import ctypes
 import time
 import random
@@ -21,11 +22,11 @@ TYPE_PREPARE_TRANSMISSION = 0b0111
 TYPE_FRAGMENT_ACK = 0b1000
 TYPE_ACTION_ACK = 0b1001
 
-WINDOW_SIZE = 5
+WINDOW_SIZE = 10
 RETRY_COUNT = 5
 TIMEOUT = 2
 MAX_FRAGMENT_SIZE = 1467
-KEEP_ALIVE_TIMEOUT = 15
+KEEP_ALIVE_TIMEOUT = 25
 KEEP_ALIVE_SEND_PERIODIC = 5
 SENDING_FRAGMENT_TIMEOUT = 5
 MAX_DATA_PAYLOAD = 2_097_152
@@ -59,17 +60,22 @@ conn.settimeout(1)
 
 # Main function initializes first mode of client and launches loop function
 def main():
-    global is_sender
+    global is_sender, terminating
     print("Select mode:\nr - Receiver\ns - Sender")
     data = input()
     if (data == "r") or data == "s":
         threading.Thread(target=data_handler).start()
+        time.sleep(0.1)
         if data == "r":
             is_sender = False
-            init_receiver()
+            if not init_receiver():
+                terminating = True
+                return
         elif data == "s":
             is_sender = True
-            init_sender()
+            if not init_sender():
+                terminating = True
+                return
     else:
         print("Invalid option, terminating.")
         exit(0)
@@ -103,9 +109,7 @@ def interruptable_input():
 
 # Loop method prints user actions on screen and executes methods. Actions vary depending on mode
 def loop():
-    global is_connected
-    global is_sender
-    global swapping
+    global is_connected, is_sender, swapping
     try:
         while True:
             if is_sender:
@@ -141,6 +145,8 @@ def loop():
                         swapping = True
                     else:
                         print("Could not swap. Client did not respond")
+            else:
+                time.sleep(0.1)
             if terminating:
                 break
             if swapping:
@@ -158,7 +164,11 @@ def loop():
 # Method initializes receiver as first mode
 def init_receiver():
     global conn
-    ip = socket.gethostbyname(socket.gethostname())
+    try:
+        data = subprocess.check_output(['hostname', '-I'])
+        ip = data.decode().split(' ')[0]
+    except:
+        ip = socket.gethostbyname(socket.gethostname())
     while True:
         print("Enter port number. Press Enter to auto assign.")
         port_str = input()
@@ -186,7 +196,7 @@ def init_sender():
         print("Ip addr: ", end='')
         ip_addr = input()
         print("Port: ", end='')
-        port = int(input())
+        port = input()
         if not connect(ip_addr, port):
             print("Failed to connect, type n to terminate")
             data = input()
@@ -231,7 +241,7 @@ def build_packet(msg_type, fragment=0, data: bytes = None, simulate_error=False)
 # Detects corruptions or data and starts dispatcher thread so it can listen again without block
 def data_handler():
     print("Starting data handler job")
-    while True:
+    while not terminating:
         try:
             pair = conn.recvfrom(1472)
             data = pair[0]
@@ -246,8 +256,7 @@ def data_handler():
         except socket.timeout:
             pass
         except OSError:
-            print("Terminating data handler job")
-            break
+            pass
 
 
 # Function works as ack required send. Client sends the packet with retry count and waits for acknowledgement
@@ -298,8 +307,11 @@ def keep_alive():
     print("Starting keep alive job")
     while is_connected:
         if time.time() - last_sent_millis > KEEP_ALIVE_SEND_PERIODIC:
-            conn.sendto(build_packet(TYPE_ALIVE_MESSAGE), client)
-            last_sent_millis = time.time()
+            try:
+                conn.sendto(build_packet(TYPE_ALIVE_MESSAGE), client)
+                last_sent_millis = time.time()
+            except:
+                pass
         if (time.time() - last_alive) > KEEP_ALIVE_TIMEOUT:
             print("Keep alive exceeded, terminating.")
             hard_terminate()
@@ -448,8 +460,9 @@ def get_preferred_fragment():
 def all_data_sent():
     if not ((window_index == len(fragmented_data)) and len(repeat_indexes) == 0):
         return False
-    for fragment in fragmented_data:
-        if not fragment["ack_state"]:
+    start_index = 0 if window_index < WINDOW_SIZE else window_index - WINDOW_SIZE
+    for i in range(start_index, window_index):
+        if not fragmented_data[i]["ack_state"]:
             return False
     return True
 
@@ -501,15 +514,21 @@ def send_bytes(data, start_payload, ask_errors=True):
         pass
     print("STARTING TRANSFER")
     while not all_data_sent():
+        if terminating:
+            return
         if free_window > 0:
             free_window -= 1
             fragment = get_preferred_fragment()
             if fragment is not None:
                 print(f"SENDING {fragment['index']} corrupted: {fragment['simulate_error']}")
-                conn.sendto(build_packet(TYPE_DATA_FRAGMENT, fragment["index"],
-                                         fragment["data"], fragment["simulate_error"]), client)
-                fragment["simulate_error"] = False
-                fragment["sent_time"] = time.time()
+                try:
+                    conn.sendto(build_packet(TYPE_DATA_FRAGMENT, fragment["index"],
+                                             fragment["data"], fragment["simulate_error"]), client)
+                    fragment["simulate_error"] = False
+                    fragment["sent_time"] = time.time()
+                except:
+                    free_window += 1
+                    window_index -= 1
         else:
             check_timeouts()
     if not await_response(build_packet(TYPE_DATA_TRANSMISSION_COMPLETE)):
@@ -553,10 +572,14 @@ def connect(ip, conn_port):
     global client
     global is_connected
     print("Connecting...")
-    client = (ip, conn_port)
-    if not await_response(build_packet(TYPE_START_CONN)):
-        print("Failed to connect")
-        client = None
+    try:
+        client = (ip, int(conn_port))
+        if not await_response(build_packet(TYPE_START_CONN)):
+            print("Failed to connect")
+            client = None
+            return False
+    except:
+        print("Invalid data entered")
         return False
     print("Connected")
     is_connected = True
