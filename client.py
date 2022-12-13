@@ -315,6 +315,7 @@ def keep_alive():
         if (time.time() - last_alive) > KEEP_ALIVE_TIMEOUT:
             print("Keep alive exceeded, terminating.")
             hard_terminate()
+        time.sleep(0.1)
     print("Terminating keep alive job")
 
 
